@@ -83,12 +83,14 @@ class UploadManager:
         st.session_state.UPLOAD_KEYS[key] = is_multi
 
     def clear_all(self):
-        # IMPORTANT: don't assign to widget keys; remove them (Streamlit policy)
+        # Remove the widget keys so file_uploader resets visually in the frontend
         for key in list(st.session_state.get("UPLOAD_KEYS", {}).keys()):
             st.session_state.pop(key, None)
-        # Clear any helper states tied to uploads
+        # Clear helper states tied to uploads
         for helper_key in ["file_order"]:
             st.session_state.pop(helper_key, None)
+        # Reset registry
+        st.session_state.UPLOAD_KEYS = {}
 
 
 TMP = TempManager()
@@ -179,7 +181,8 @@ def show_progress(message, progress=0):
 
 # ---------- PDF ORGANIZATION FUNCTIONS ----------
 
-def merge_pdfs(files, order, passwords_dict):
+def merge_pdfs(files, order, passwords_list):
+    """Merge multiple PDFs into one. passwords_list is per original index in files."""
     merger = PdfMerger()
     progress_bar, status_text = show_progress("Starting PDF merge...", 10)
     total_files = len(order)
@@ -187,20 +190,24 @@ def merge_pdfs(files, order, passwords_dict):
     for i, idx in enumerate(order):
         file = files[idx]
         filename = file.name
-        password = passwords_dict.get(filename, "")
+        password = passwords_list[idx] if idx < len(passwords_list) else ""
+
         try:
             file.seek(0)
             reader = PdfReader(file)
+
             if reader.is_encrypted:
                 if not password:
                     raise ValueError(f"{filename} is encrypted but no password was provided.")
                 if reader.decrypt(password) == 0:
                     raise ValueError(f"Incorrect password for {filename}.")
+
             merger.append(reader)
             progress_percent = int(10 + ((i + 1) / total_files) * 80)
             status_text.text(f"Processing file {i + 1} of {total_files}...")
             progress_bar.progress(progress_percent)
             time.sleep(0.1)
+
         except Exception as e:
             st.error(f"Error merging file {filename}: {e}")
             return None
@@ -885,9 +892,14 @@ def main():
                         st.rerun()
 
             st.subheader("🔐 Passwords for Encrypted PDFs")
-            passwords = {}
-            for f in uploaded_pdfs:
-                passwords[f.name] = st.text_input(f"Enter password for {f.name}", type="password", key=f"pw_{f.name}")
+            passwords = []
+            for i, f in enumerate(uploaded_pdfs):
+                pw = st.text_input(
+                    f"Enter password for file #{i+1}: {f.name}",
+                    type="password",
+                    key=f"pw_{i}"  # unique per index
+                )
+                passwords.append(pw)
 
             if st.button("Merge PDFs"):
                 with st.spinner("Merging PDFs..."):
