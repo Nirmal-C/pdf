@@ -6,7 +6,7 @@ import zipfile
 from datetime import datetime
 import subprocess
 import atexit
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict
 
 # Core PDF libraries
 from PyPDF2 import PdfMerger, PdfReader, PdfWriter
@@ -74,10 +74,7 @@ class TempManager:
 
 
 class UploadManager:
-    """
-    Tracks all file_uploader widget keys and whether they accept multiple files.
-    Allows centralized clearing of all uploads.
-    """
+    """Tracks all file_uploader widget keys; allows centralized clearing."""
     def __init__(self):
         if "UPLOAD_KEYS" not in st.session_state:
             st.session_state.UPLOAD_KEYS: Dict[str, bool] = {}  # key -> is_multi
@@ -86,15 +83,14 @@ class UploadManager:
         st.session_state.UPLOAD_KEYS[key] = is_multi
 
     def clear_all(self):
-        # Reset all uploader widgets
         for key, is_multi in list(st.session_state.UPLOAD_KEYS.items()):
             if key in st.session_state:
                 st.session_state[key] = [] if is_multi else None
-
         # Clear any helper states tied to uploads
         for helper_key in ["file_order"]:
             if helper_key in st.session_state:
                 st.session_state.pop(helper_key)
+
 
 TMP = TempManager()
 UP = UploadManager()
@@ -235,7 +231,7 @@ def split_pdf(file, page_ranges, password=None):
                 raise ValueError("Incorrect password.")
 
         splits = []
-        for idx, (start, end) in enumerate(page_ranges):
+        for (start, end) in page_ranges:
             writer = PdfWriter()
             for i in range(start - 1, end):
                 if i < len(reader.pages):
@@ -498,10 +494,10 @@ def pdf_to_excel(pdf_file, password=None, extract_method="tables"):
                                     continue
                 if not tables_found:
                     all_text = []
-                    for page_num in range(doc.page_count):
-                        t = doc[page_num].get_text()
+                    for p in range(doc.page_count):
+                        t = doc[p].get_text()
                         if t.strip():
-                            all_text.extend([f"=== Page {page_num+1} ===", t.strip(), ""])
+                            all_text.extend([f"=== Page {p+1} ===", t.strip(), ""])
                     if all_text:
                         df = pd.DataFrame({'Content': all_text})
                         df.to_excel(writer, sheet_name='All_Text', index=False)
@@ -904,68 +900,74 @@ def main():
         password = st.text_input("Password if encrypted", type="password")
 
         if pdf_file:
+            # Safely read basic info (CLOSED try/except so it can't leak)
+            num_pages = None
             try:
                 pdf_file.seek(0)
                 reader = PdfReader(pdf_file)
                 if reader.is_encrypted and password:
                     reader.decrypt(password)
                 num_pages = len(reader.pages)
+            except Exception as e:
+                st.error(f"Unable to read PDF: {e}")
+
+            if num_pages:
                 st.info(f"PDF has {num_pages} pages.")
+                # Preview (do not wrap the whole block in try)
                 pdf_file.seek(0)
                 preview = get_pdf_preview(pdf_file, 0, password)
                 if preview:
                     st.image(preview, caption="First page preview", width=300)
-            except Exception as e:
-                st.error(f"Unable to read PDF: {e}")
-                return
 
-            st.subheader("Page Splitting Options")
-            auto_split = st.checkbox("🔁 Auto-split in equal groups")
-            if auto_split:
-                group_size = st.number_input("Pages per group", min_value=1, max_value=num_pages, value=2, step=1)
-                range_input = None
-            else:
-                range_input = st.text_input("Enter page ranges (e.g., 1-2,3-4,5-6)")
+                st.subheader("Page Splitting Options")
+                auto_split = st.checkbox("🔁 Auto-split in equal groups")
+                if auto_split:
+                    group_size = st.number_input("Pages per group", min_value=1, max_value=num_pages, value=2, step=1)
+                    range_input = None
+                else:
+                    range_input = st.text_input("Enter page ranges (e.g., 1-2,3-4,5-6)")
 
-            if st.button("Split PDF", type="primary"):
-                try:
-                    ranges = []
-                    if auto_split:
-                        for start in range(1, num_pages + 1, group_size):
-                            end = min(start + group_size - 1, num_pages)
-                            ranges.append((start, end))
-                    else:
-                        for part in range_input.split(','):
-                            if '-' in part:
-                                start, end = map(int, part.strip().split('-'))
-                            else:
-                                start = end = int(part.strip())
-                            if start <= end <= num_pages:
+                if st.button("Split PDF", type="primary"):
+                    try:
+                        ranges = []
+                        if auto_split:
+                            for start in range(1, num_pages + 1, group_size):
+                                end = min(start + group_size - 1, num_pages)
                                 ranges.append((start, end))
-                            else:
-                                st.warning(f"Ignored invalid range: {part}")
+                        else:
+                            for part in range_input.split(','):
+                                if '-' in part:
+                                    start, end = map(int, part.strip().split('-'))
+                                else:
+                                    start = end = int(part.strip())
+                                if start <= end <= num_pages:
+                                    ranges.append((start, end))
+                                else:
+                                    st.warning(f"Ignored invalid range: {part}")
 
-                    if ranges:
-                        pdf_file.seek(0)
-                        split_files = split_pdf(pdf_file, ranges, password)
+                        if ranges:
+                            pdf_file.seek(0)
+                            split_files = split_pdf(pdf_file, ranges, password)
 
-                        for name, content in split_files:
-                            clicked_each = st.download_button(f"📥 Download {name}", content, file_name=name, mime="application/pdf", key=f"dl_split_{name}")
-                            if clicked_each:
+                            for name, content in split_files:
+                                clicked_each = st.download_button(f"📥 Download {name}", content, file_name=name, mime="application/pdf", key=f"dl_split_{name}")
+                                if clicked_each:
+                                    TMP.cleanup()
+                                    st.info("Temporary files removed.")
+
+                            zip_buffer = io.BytesIO()
+                            with zipfile.ZipFile(zip_buffer, 'w') as zip_file:
+                                for name, content in split_files:
+                                    zip_file.writestr(name, content)
+                            zip_buffer.seek(0)
+
+                            clicked_zip = st.download_button("📦 Download All as ZIP", zip_buffer.getvalue(),
+                                                             file_name="split_files.zip", mime="application/zip", key="dl_split_zip")
+                            if clicked_zip:
                                 TMP.cleanup()
                                 st.info("Temporary files removed.")
-
-                        zip_buffer = io.BytesIO()
-                        with zipfile.ZipFile(zip_buffer, 'w') as zip_file:
-                            for name, content in split_files:
-                                zip_file.writestr(name, content)
-                        zip_buffer.seek(0)
-
-                        clicked_zip = st.download_button("📦 Download All as ZIP", zip_buffer.getvalue(),
-                                                         file_name="split_files.zip", mime="application/zip", key="dl_split_zip")
-                        if clicked_zip:
-                            TMP.cleanup()
-                            st.info("Temporary files removed.")
+                    except Exception as e:
+                        st.error(f"Error processing split: {e}")
 
     elif selected_tool == "Compress PDF":
         st.header("🗜️ Compress PDF")
@@ -1544,6 +1546,7 @@ def main():
                                     if clicked:
                                         TMP.cleanup()
                                         st.info("Temporary files removed.")
+
                     except Exception as e:
                         st.error(f"Error: {e}")
 
