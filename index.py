@@ -1770,7 +1770,7 @@ def main():
     st.markdown("""
     <div style="text-align: center; color: #666; padding: 2rem;">
         <p>Comprehensive PDF Toolkit - Your all-in-one PDF solution</p>
-        <p>Built with ❤️ by Nirmal#C</p>
+        <p>Built with ❤️</p>
     </div>
     """, unsafe_allow_html=True)
 
