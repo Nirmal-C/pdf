@@ -1,14 +1,12 @@
 import streamlit as st
 import io
 import os
-import base64
 import time
 import zipfile
 from datetime import datetime
-import math
 import subprocess
 import atexit
-from typing import List
+from typing import List, Dict, Tuple, Optional
 
 # Core PDF libraries
 from PyPDF2 import PdfMerger, PdfReader, PdfWriter
@@ -48,41 +46,58 @@ except ImportError:
     REPORTLAB_AVAILABLE = False
 
 
-# ============ TEMP FILE MANAGER ==============================================
+# ============ STATE HELPERS (Temp + Uploads) =================================
 class TempManager:
     def __init__(self):
         if "TMP_PATHS" not in st.session_state:
             st.session_state.TMP_PATHS: List[str] = []
 
     def create(self, suffix: str = ""):
-        """
-        Create a temp file and register it for cleanup.
-        Returns an open file object; use .name for path.
-        """
-        # Use NamedTemporaryFile with delete=False to get a stable path; we manage cleanup.
         import tempfile
         f = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
         st.session_state.TMP_PATHS.append(f.name)
         return f
 
     def register(self, path: str):
-        """Register an existing temp path for cleanup."""
         if path and path not in st.session_state.TMP_PATHS:
             st.session_state.TMP_PATHS.append(path)
 
     def cleanup(self):
-        """Delete all registered temp files if they still exist."""
         kept = []
         for p in list(st.session_state.TMP_PATHS):
             try:
                 if os.path.exists(p):
                     os.unlink(p)
             except Exception:
-                kept.append(p)  # keep paths we failed to delete
+                kept.append(p)
         st.session_state.TMP_PATHS = kept
 
 
+class UploadManager:
+    """
+    Tracks all file_uploader widget keys and whether they accept multiple files.
+    Allows centralized clearing of all uploads.
+    """
+    def __init__(self):
+        if "UPLOAD_KEYS" not in st.session_state:
+            st.session_state.UPLOAD_KEYS: Dict[str, bool] = {}  # key -> is_multi
+
+    def register(self, key: str, is_multi: bool):
+        st.session_state.UPLOAD_KEYS[key] = is_multi
+
+    def clear_all(self):
+        # Reset all uploader widgets
+        for key, is_multi in list(st.session_state.UPLOAD_KEYS.items()):
+            if key in st.session_state:
+                st.session_state[key] = [] if is_multi else None
+
+        # Clear any helper states tied to uploads
+        for helper_key in ["file_order"]:
+            if helper_key in st.session_state:
+                st.session_state.pop(helper_key)
+
 TMP = TempManager()
+UP = UploadManager()
 atexit.register(lambda: TMP.cleanup())
 # ============================================================================
 
@@ -95,7 +110,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS for better styling
+# Custom CSS
 st.markdown("""
 <style>
     .main-header {
@@ -106,26 +121,12 @@ st.markdown("""
         text-align: center;
         margin-bottom: 2rem;
     }
-    .tool-card {
-        background: #f8f9fa;
-        padding: 1.5rem;
-        border-radius: 10px;
-        border-left: 4px solid #667eea;
-        margin-bottom: 1rem;
-    }
     .stButton > button {
         background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
         color: white;
         border: none;
         border-radius: 5px;
         padding: 0.5rem 1rem;
-    }
-    .success-box {
-        background: #d4edda;
-        padding: 1rem;
-        border-radius: 5px;
-        border-left: 4px solid #28a745;
-        margin: 1rem 0;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -134,12 +135,9 @@ st.markdown("""
 # ---------- UTILITY FUNCTIONS ----------
 
 def get_pdf_info(pdf_file):
-    """Get basic information about a PDF file"""
     try:
         with TMP.create('.pdf') as temp_file:
-            temp_file.write(pdf_file.read())
-            temp_file.flush()
-
+            temp_file.write(pdf_file.read()); temp_file.flush()
             doc = fitz.open(temp_file.name)
             info = {
                 'pages': doc.page_count,
@@ -158,32 +156,26 @@ def get_pdf_info(pdf_file):
 
 
 def get_pdf_preview(pdf_file, page_num=0, password=None):
-    """Generate a preview of a PDF page"""
     try:
         with TMP.create('.pdf') as temp_file:
-            temp_file.write(pdf_file.read())
-            temp_file.flush()
-
+            temp_file.write(pdf_file.read()); temp_file.flush()
             doc = fitz.open(temp_file.name)
             if doc.needs_pass and password:
                 doc.authenticate(password)
-
             if page_num < doc.page_count:
                 page = doc[page_num]
                 pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
                 img_data = pix.tobytes("png")
                 doc.close()
                 return img_data
-            else:
-                doc.close()
-                return None
+            doc.close()
+            return None
     except Exception as e:
         st.error(f"Error generating preview: {e}")
         return None
 
 
 def show_progress(message, progress=0):
-    """Show progress bar with message"""
     progress_bar = st.progress(progress)
     status_text = st.empty()
     status_text.text(message)
@@ -193,33 +185,27 @@ def show_progress(message, progress=0):
 # ---------- PDF ORGANIZATION FUNCTIONS ----------
 
 def merge_pdfs(files, order, passwords_dict):
-    """Merge multiple PDFs into one"""
     merger = PdfMerger()
     progress_bar, status_text = show_progress("Starting PDF merge...", 10)
-
     total_files = len(order)
 
     for i, idx in enumerate(order):
         file = files[idx]
         filename = file.name
         password = passwords_dict.get(filename, "")
-
         try:
             file.seek(0)
             reader = PdfReader(file)
-
             if reader.is_encrypted:
                 if not password:
                     raise ValueError(f"{filename} is encrypted but no password was provided.")
                 if reader.decrypt(password) == 0:
                     raise ValueError(f"Incorrect password for {filename}.")
-
             merger.append(reader)
             progress_percent = int(10 + ((i + 1) / total_files) * 80)
             status_text.text(f"Processing file {i + 1} of {total_files}...")
             progress_bar.progress(progress_percent)
             time.sleep(0.1)
-
         except Exception as e:
             st.error(f"Error merging file {filename}: {e}")
             return None
@@ -235,15 +221,11 @@ def merge_pdfs(files, order, passwords_dict):
     status_text.text("Merge complete!")
     progress_bar.progress(100)
     time.sleep(0.5)
-
-    progress_bar.empty()
-    status_text.empty()
-
+    progress_bar.empty(); status_text.empty()
     return output.getvalue()
 
 
 def split_pdf(file, page_ranges, password=None):
-    """Split PDF into multiple files"""
     try:
         reader = PdfReader(file)
         if reader.is_encrypted:
@@ -258,12 +240,10 @@ def split_pdf(file, page_ranges, password=None):
             for i in range(start - 1, end):
                 if i < len(reader.pages):
                     writer.add_page(reader.pages[i])
-
             output = io.BytesIO()
             writer.write(output)
             output.seek(0)
             splits.append((f"split_{start}_{end}.pdf", output.read()))
-
         return splits
     except Exception as e:
         st.error(f"Error splitting PDF: {e}")
@@ -271,26 +251,18 @@ def split_pdf(file, page_ranges, password=None):
 
 
 def organize_pdf_pages(pdf_file, new_order, password=None):
-    """Reorganize PDF pages according to new order"""
     try:
         with TMP.create('.pdf') as temp_file:
-            temp_file.write(pdf_file.read())
-            temp_file.flush()
-
+            temp_file.write(pdf_file.read()); temp_file.flush()
             doc = fitz.open(temp_file.name)
             if doc.needs_pass and password:
                 doc.authenticate(password)
-
             new_doc = fitz.open()
             for page_num in new_order:
                 if 0 <= page_num < doc.page_count:
                     new_doc.insert_pdf(doc, from_page=page_num, to_page=page_num)
-
             output = io.BytesIO()
-            new_doc.save(output)
-            new_doc.close()
-            doc.close()
-
+            new_doc.save(output); new_doc.close(); doc.close()
             output.seek(0)
             return output.getvalue()
     except Exception as e:
@@ -299,25 +271,17 @@ def organize_pdf_pages(pdf_file, new_order, password=None):
 
 
 def remove_pdf_pages(pdf_file, pages_to_remove, password=None):
-    """Remove specified pages from PDF"""
     try:
         with TMP.create('.pdf') as temp_file:
-            temp_file.write(pdf_file.read())
-            temp_file.flush()
-
+            temp_file.write(pdf_file.read()); temp_file.flush()
             doc = fitz.open(temp_file.name)
             if doc.needs_pass and password:
                 doc.authenticate(password)
-
-            # Remove pages in reverse order to maintain indices
             for page_num in sorted(pages_to_remove, reverse=True):
                 if 0 <= page_num < doc.page_count:
                     doc.delete_page(page_num)
-
             output = io.BytesIO()
-            doc.save(output)
-            doc.close()
-
+            doc.save(output); doc.close()
             output.seek(0)
             return output.getvalue()
     except Exception as e:
@@ -326,26 +290,18 @@ def remove_pdf_pages(pdf_file, pages_to_remove, password=None):
 
 
 def extract_pdf_pages(pdf_file, pages_to_extract, password=None):
-    """Extract specified pages from PDF"""
     try:
         with TMP.create('.pdf') as temp_file:
-            temp_file.write(pdf_file.read())
-            temp_file.flush()
-
+            temp_file.write(pdf_file.read()); temp_file.flush()
             doc = fitz.open(temp_file.name)
             if doc.needs_pass and password:
                 doc.authenticate(password)
-
             new_doc = fitz.open()
             for page_num in sorted(pages_to_extract):
                 if 0 <= page_num < doc.page_count:
                     new_doc.insert_pdf(doc, from_page=page_num, to_page=page_num)
-
             output = io.BytesIO()
-            new_doc.save(output)
-            new_doc.close()
-            doc.close()
-
+            new_doc.save(output); new_doc.close(); doc.close()
             output.seek(0)
             return output.getvalue()
     except Exception as e:
@@ -356,31 +312,21 @@ def extract_pdf_pages(pdf_file, pages_to_extract, password=None):
 # ---------- PDF OPTIMIZATION FUNCTIONS ----------
 
 def compress_pdf(pdf_file, quality="medium", password=None):
-    """Compress PDF file using Ghostscript"""
     try:
-        # Create temporary files
         with TMP.create('.pdf') as temp_input:
             temp_input.write(pdf_file.read())
             temp_input_path = temp_input.name
-
         with TMP.create('.pdf') as temp_output:
             temp_output_path = temp_output.name
 
-        # Ghostscript quality settings
-        quality_settings = {
-            "high": "/prepress",
-            "medium": "/ebook",
-            "low": "/screen"
-        }
+        quality_settings = {"high": "/prepress", "medium": "/ebook", "low": "/screen"}
 
         gs_command = [
             "gs",
             "-sDEVICE=pdfwrite",
             "-dCompatibilityLevel=1.4",
             f"-dPDFSETTINGS={quality_settings.get(quality, '/ebook')}",
-            "-dNOPAUSE",
-            "-dQUIET",
-            "-dBATCH",
+            "-dNOPAUSE", "-dQUIET", "-dBATCH",
             f"-sOutputFile={temp_output_path}",
             temp_input_path
         ]
@@ -388,22 +334,17 @@ def compress_pdf(pdf_file, quality="medium", password=None):
         result = subprocess.run(gs_command, capture_output=True, text=True)
 
         if result.returncode != 0:
-            # Fallback to PyMuPDF if Ghostscript fails
             doc = fitz.open(temp_input_path)
             if doc.needs_pass and password:
                 doc.authenticate(password)
-
             output = io.BytesIO()
             doc.save(output, deflate=True, clean=True, garbage=4)
             doc.close()
-
             output.seek(0)
             return output.getvalue()
 
-        # Read compressed PDF
         with open(temp_output_path, 'rb') as f:
             compressed_data = f.read()
-
         return compressed_data
 
     except Exception as e:
@@ -412,20 +353,15 @@ def compress_pdf(pdf_file, quality="medium", password=None):
 
 
 def optimize_pdf(pdf_file, password=None):
-    """Optimize PDF for web viewing"""
     try:
         with TMP.create('.pdf') as temp_file:
-            temp_file.write(pdf_file.read())
-            temp_file.flush()
-
+            temp_file.write(pdf_file.read()); temp_file.flush()
             doc = fitz.open(temp_file.name)
             if doc.needs_pass and password:
                 doc.authenticate(password)
-
             output = io.BytesIO()
             doc.save(output, garbage=4, deflate=True, clean=True)
             doc.close()
-
             output.seek(0)
             return output.getvalue()
     except Exception as e:
@@ -434,17 +370,12 @@ def optimize_pdf(pdf_file, password=None):
 
 
 def repair_pdf(pdf_file, password=None):
-    """Repair corrupted PDF"""
     try:
         with TMP.create('.pdf') as temp_file:
-            temp_file.write(pdf_file.read())
-            temp_file.flush()
-
+            temp_file.write(pdf_file.read()); temp_file.flush()
             doc = fitz.open(temp_file.name)
             if doc.needs_pass and password:
                 doc.authenticate(password)
-
-            # Create new document and copy all pages
             new_doc = fitz.open()
             for page_num in range(doc.page_count):
                 try:
@@ -452,12 +383,8 @@ def repair_pdf(pdf_file, password=None):
                 except:
                     st.warning(f"Skipped corrupted page {page_num + 1}")
                     continue
-
             output = io.BytesIO()
-            new_doc.save(output, clean=True)
-            new_doc.close()
-            doc.close()
-
+            new_doc.save(output); new_doc.close(); doc.close()
             output.seek(0)
             return output.getvalue()
     except Exception as e:
@@ -468,48 +395,31 @@ def repair_pdf(pdf_file, password=None):
 # ---------- OCR FUNCTIONS ----------
 
 def ocr_pdf(pdf_file, language='eng', password=None):
-    """Perform OCR on PDF to make it searchable"""
     if not TESSERACT_AVAILABLE:
         st.error("Tesseract OCR is not available. Please install pytesseract.")
         return None
-
     try:
         with TMP.create('.pdf') as temp_file:
-            temp_file.write(pdf_file.read())
-            temp_file.flush()
-
+            temp_file.write(pdf_file.read()); temp_file.flush()
             doc = fitz.open(temp_file.name)
             if doc.needs_pass and password:
                 doc.authenticate(password)
-
             new_doc = fitz.open()
-
             for page_num in range(doc.page_count):
                 page = doc[page_num]
                 pix = page.get_pixmap()
                 img_data = pix.tobytes("png")
-
-                # Perform OCR
                 if PIL_AVAILABLE:
                     image = Image.open(io.BytesIO(img_data))
                     text = pytesseract.image_to_string(image, lang=language)
-
-                    # Create new page with OCR text
                     new_page = new_doc.new_page(width=page.rect.width, height=page.rect.height)
                     new_page.insert_image(page.rect, pixmap=pix)
-
-                    # Add invisible text layer (placeholder; true text-layer mapping is complex)
                     if text.strip():
                         new_page.insert_text((50, 50), text, fontsize=1, color=(1, 1, 1))
                 else:
-                    # Just copy the page if PIL is not available
                     new_doc.insert_pdf(doc, from_page=page_num, to_page=page_num)
-
             output = io.BytesIO()
-            new_doc.save(output)
-            new_doc.close()
-            doc.close()
-
+            new_doc.save(output); new_doc.close(); doc.close()
             output.seek(0)
             return output.getvalue()
     except Exception as e:
@@ -517,38 +427,29 @@ def ocr_pdf(pdf_file, language='eng', password=None):
         return None
 
 
-# ---------- PDF TO EXCEL CONVERSION FUNCTION ----------
+# ---------- PDF TO EXCEL ----------
 
 def pdf_to_excel(pdf_file, password=None, extract_method="tables"):
-    """Convert PDF tables to Excel format"""
     if not PANDAS_AVAILABLE:
         st.error("Pandas is not available. Please install pandas.")
         return None
-
     try:
         with TMP.create('.pdf') as temp_file:
-            temp_file.write(pdf_file.read())
-            temp_file.flush()
-
+            temp_file.write(pdf_file.read()); temp_file.flush()
             doc = fitz.open(temp_file.name)
             if doc.needs_pass and password:
                 doc.authenticate(password)
 
-            # Create Excel writer object
             excel_buffer = io.BytesIO()
-
             with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
                 tables_found = False
-
                 for page_num in range(doc.page_count):
                     page = doc[page_num]
-
                     if extract_method == "tables":
                         try:
                             tables = page.find_tables()
                         except Exception:
                             tables = []
-
                         for table_num, table in enumerate(tables):
                             try:
                                 table_data = table.extract()
@@ -561,14 +462,12 @@ def pdf_to_excel(pdf_file, password=None, extract_method="tables"):
                                         tables_found = True
                             except Exception:
                                 continue
-
-                    elif extract_method == "text":
+                    else:
                         text = page.get_text()
                         if text.strip():
                             lines = [line.strip() for line in text.split('\n') if line.strip()]
                             potential_tables = []
                             current_table = []
-
                             for line in lines:
                                 if '\t' in line or '|' in line or len(line.split()) > 2:
                                     if '\t' in line:
@@ -582,74 +481,54 @@ def pdf_to_excel(pdf_file, password=None, extract_method="tables"):
                                     if current_table and len(current_table) > 1:
                                         potential_tables.append(current_table)
                                     current_table = []
-
                             if current_table and len(current_table) > 1:
                                 potential_tables.append(current_table)
-
                             for table_num, table_data in enumerate(potential_tables):
                                 try:
                                     if len(table_data) > 1:
-                                        max_cols = max(len(row) for row in table_data)
-                                        normalized_data = []
-                                        for row in table_data:
-                                            normalized_row = row + [''] * (max_cols - len(row))
-                                            normalized_data.append(normalized_row[:max_cols])
-
-                                        df = pd.DataFrame(normalized_data[1:], columns=normalized_data[0])
+                                        max_cols = max(len(r) for r in table_data)
+                                        normalized = [r + ['']*(max_cols-len(r)) for r in table_data]
+                                        df = pd.DataFrame(normalized[1:], columns=normalized[0])
                                         df = df.dropna(how='all').dropna(axis=1, how='all')
-
                                         if not df.empty:
                                             sheet_name = f"Page{page_num+1}_Text{table_num+1}"
                                             df.to_excel(writer, sheet_name=sheet_name, index=False)
                                             tables_found = True
                                 except Exception:
                                     continue
-
                 if not tables_found:
                     all_text = []
                     for page_num in range(doc.page_count):
-                        page = doc[page_num]
-                        text = page.get_text()
-                        if text.strip():
-                            all_text.append(f"=== Page {page_num + 1} ===")
-                            all_text.append(text.strip())
-                            all_text.append("")
+                        t = doc[page_num].get_text()
+                        if t.strip():
+                            all_text.extend([f"=== Page {page_num+1} ===", t.strip(), ""])
                     if all_text:
                         df = pd.DataFrame({'Content': all_text})
                         df.to_excel(writer, sheet_name='All_Text', index=False)
-
             doc.close()
             excel_buffer.seek(0)
             return excel_buffer.getvalue()
-
     except Exception as e:
         st.error(f"Error converting PDF to Excel: {e}")
         return None
 
 
 def images_to_pdf(image_files):
-    """Convert multiple images to PDF"""
     if not PIL_AVAILABLE:
         st.error("PIL is not available. Please install Pillow.")
         return None
-
     try:
         doc = fitz.open()
-
         for image_file in image_files:
             image = Image.open(image_file)
             if image.mode != 'RGB':
                 image = image.convert('RGB')
-
             with TMP.create('.jpg') as temp_img:
                 image.save(temp_img.name, 'JPEG')
-
                 page = doc.new_page(width=595, height=842)  # A4
                 page.insert_image(page.rect, filename=temp_img.name)
-
         output = io.BytesIO()
-        doc.save(output)
-        doc.close()
+        doc.save(output); doc.close()
         output.seek(0)
         return output.getvalue()
     except Exception as e:
@@ -658,18 +537,12 @@ def images_to_pdf(image_files):
 
 
 def text_to_pdf(text_content, title="Document"):
-    """Convert text to PDF"""
     try:
         doc = fitz.open()
         page = doc.new_page()
-
-        # Insert text
-        text_rect = fitz.Rect(50, 50, 545, 792)
-        page.insert_text(text_rect.tl, text_content, fontsize=12, color=(0, 0, 0))
-
+        page.insert_text((50, 50), text_content, fontsize=12, color=(0, 0, 0))
         output = io.BytesIO()
-        doc.save(output)
-        doc.close()
+        doc.save(output); doc.close()
         output.seek(0)
         return output.getvalue()
     except Exception as e:
@@ -677,19 +550,15 @@ def text_to_pdf(text_content, title="Document"):
         return None
 
 
-# ---------- CONVERSION FUNCTIONS - FROM PDF ----------
+# ---------- FROM PDF ----------
 
 def pdf_to_images(pdf_file, format='PNG', dpi=150, password=None):
-    """Convert PDF pages to images"""
     try:
         with TMP.create('.pdf') as temp_file:
-            temp_file.write(pdf_file.read())
-            temp_file.flush()
-
+            temp_file.write(pdf_file.read()); temp_file.flush()
             doc = fitz.open(temp_file.name)
             if doc.needs_pass and password:
                 doc.authenticate(password)
-
             images = []
             for page_num in range(doc.page_count):
                 page = doc[page_num]
@@ -697,7 +566,6 @@ def pdf_to_images(pdf_file, format='PNG', dpi=150, password=None):
                 pix = page.get_pixmap(matrix=mat)
                 img_data = pix.tobytes(format.lower())
                 images.append((f"page_{page_num+1}.{format.lower()}", img_data))
-
             doc.close()
             return images
     except Exception as e:
@@ -706,20 +574,15 @@ def pdf_to_images(pdf_file, format='PNG', dpi=150, password=None):
 
 
 def pdf_to_text(pdf_file, password=None):
-    """Extract text from PDF"""
     try:
         with TMP.create('.pdf') as temp_file:
-            temp_file.write(pdf_file.read())
-            temp_file.flush()
-
+            temp_file.write(pdf_file.read()); temp_file.flush()
             doc = fitz.open(temp_file.name)
             if doc.needs_pass and password:
                 doc.authenticate(password)
-
             all_text = ""
             for page in doc:
                 all_text += page.get_text() + "\n\n"
-
             doc.close()
             return all_text
     except Exception as e:
@@ -728,42 +591,29 @@ def pdf_to_text(pdf_file, password=None):
 
 
 def convert_pdf_to_docx(file):
-    """Convert PDF to DOCX"""
     if not PDF2DOCX_AVAILABLE:
         st.error("pdf2docx is not available. Please install pdf2docx.")
         return None, None
-
     output = io.BytesIO()
     with TMP.create(".pdf") as temp_pdf:
         temp_pdf.write(file.read())
         temp_pdf_path = temp_pdf.name
-
     with TMP.create(".docx") as temp_docx:
         temp_docx_path = temp_docx.name
-
     progress_bar = st.progress(0)
     status_text = st.empty()
     status_text.text("Starting conversion...")
-    time.sleep(0.2)
-    progress_bar.progress(20)
-
+    time.sleep(0.2); progress_bar.progress(20)
     try:
         cv = Converter(temp_pdf_path)
         status_text.text("Converting to DOCX...")
         cv.convert(temp_docx_path, start=0, end=None)
-        cv.close()
-        progress_bar.progress(80)
-
+        cv.close(); progress_bar.progress(80)
         with open(temp_docx_path, "rb") as f:
             output.write(f.read())
         output.seek(0)
-
-        progress_bar.progress(100)
-        status_text.text("Conversion complete!")
-        time.sleep(0.5)
-        progress_bar.empty()
-        status_text.empty()
-
+        progress_bar.progress(100); status_text.text("Conversion complete!")
+        time.sleep(0.5); progress_bar.empty(); status_text.empty()
         return output.getvalue(), "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     except Exception as e:
         st.error(f"Error converting PDF to DOCX: {e}")
@@ -773,28 +623,19 @@ def convert_pdf_to_docx(file):
 # ---------- PDF EDITING FUNCTIONS ----------
 
 def rotate_pdf(pdf_file, rotation_angle, pages=None, password=None):
-    """Rotate PDF pages"""
     try:
         with TMP.create('.pdf') as temp_file:
-            temp_file.write(pdf_file.read())
-            temp_file.flush()
-
+            temp_file.write(pdf_file.read()); temp_file.flush()
             doc = fitz.open(temp_file.name)
             if doc.needs_pass and password:
                 doc.authenticate(password)
-
             if pages is None:
                 pages = list(range(doc.page_count))
-
             for page_num in pages:
                 if 0 <= page_num < doc.page_count:
-                    page = doc[page_num]
-                    page.set_rotation(rotation_angle)
-
+                    doc[page_num].set_rotation(rotation_angle)
             output = io.BytesIO()
-            doc.save(output)
-            doc.close()
-
+            doc.save(output); doc.close()
             output.seek(0)
             return output.getvalue()
     except Exception as e:
@@ -803,19 +644,14 @@ def rotate_pdf(pdf_file, rotation_angle, pages=None, password=None):
 
 
 def add_watermark(pdf_file, watermark_text, position="center", opacity=0.3, password=None):
-    """Add watermark to PDF"""
     try:
         with TMP.create('.pdf') as temp_file:
-            temp_file.write(pdf_file.read())
-            temp_file.flush()
-
+            temp_file.write(pdf_file.read()); temp_file.flush()
             doc = fitz.open(temp_file.name)
             if doc.needs_pass and password:
                 doc.authenticate(password)
-
             for page in doc:
                 rect = page.rect
-
                 if position == "center":
                     point = fitz.Point(rect.width/2, rect.height/2)
                 elif position == "top-left":
@@ -824,21 +660,11 @@ def add_watermark(pdf_file, watermark_text, position="center", opacity=0.3, pass
                     point = fitz.Point(rect.width-100, 50)
                 elif position == "bottom-left":
                     point = fitz.Point(50, rect.height-50)
-                else:  # bottom-right
+                else:
                     point = fitz.Point(rect.width-100, rect.height-50)
-
-                page.insert_text(
-                    point,
-                    watermark_text,
-                    fontsize=40,
-                    color=(0.7, 0.7, 0.7),
-                    rotate=45
-                )
-
+                page.insert_text(point, watermark_text, fontsize=40, color=(0.7, 0.7, 0.7), rotate=45)
             output = io.BytesIO()
-            doc.save(output)
-            doc.close()
-
+            doc.save(output); doc.close()
             output.seek(0)
             return output.getvalue()
     except Exception as e:
@@ -847,40 +673,26 @@ def add_watermark(pdf_file, watermark_text, position="center", opacity=0.3, pass
 
 
 def add_page_numbers(pdf_file, position="bottom-right", start_num=1, password=None):
-    """Add page numbers to PDF"""
     try:
         with TMP.create('.pdf') as temp_file:
-            temp_file.write(pdf_file.read())
-            temp_file.flush()
-
+            temp_file.write(pdf_file.read()); temp_file.flush()
             doc = fitz.open(temp_file.name)
             if doc.needs_pass and password:
                 doc.authenticate(password)
-
             for page_num, page in enumerate(doc):
                 rect = page.rect
                 page_number = start_num + page_num
-
                 if position == "bottom-right":
                     point = fitz.Point(rect.width-50, rect.height-20)
                 elif position == "bottom-left":
                     point = fitz.Point(30, rect.height-20)
                 elif position == "top-right":
                     point = fitz.Point(rect.width-50, 30)
-                else:  # top-left
+                else:
                     point = fitz.Point(30, 30)
-
-                page.insert_text(
-                    point,
-                    str(page_number),
-                    fontsize=12,
-                    color=(0, 0, 0)
-                )
-
+                page.insert_text(point, str(page_number), fontsize=12, color=(0, 0, 0))
             output = io.BytesIO()
-            doc.save(output)
-            doc.close()
-
+            doc.save(output); doc.close()
             output.seek(0)
             return output.getvalue()
     except Exception as e:
@@ -889,23 +701,16 @@ def add_page_numbers(pdf_file, position="bottom-right", start_num=1, password=No
 
 
 def crop_pdf(pdf_file, crop_box, password=None):
-    """Crop PDF pages"""
     try:
         with TMP.create('.pdf') as temp_file:
-            temp_file.write(pdf_file.read())
-            temp_file.flush()
-
+            temp_file.write(pdf_file.read()); temp_file.flush()
             doc = fitz.open(temp_file.name)
             if doc.needs_pass and password:
                 doc.authenticate(password)
-
             for page in doc:
                 page.set_cropbox(fitz.Rect(crop_box))
-
             output = io.BytesIO()
-            doc.save(output)
-            doc.close()
-
+            doc.save(output); doc.close()
             output.seek(0)
             return output.getvalue()
     except Exception as e:
@@ -916,25 +721,20 @@ def crop_pdf(pdf_file, crop_box, password=None):
 # ---------- PDF SECURITY FUNCTIONS ----------
 
 def protect_pdf(pdf_file, user_password, owner_password=None, password=None):
-    """Add password protection to PDF"""
     try:
         reader = PdfReader(pdf_file)
         if reader.is_encrypted and password:
             reader.decrypt(password)
-
         writer = PdfWriter()
         for page in reader.pages:
             writer.add_page(page)
-
         writer.encrypt(
             user_password=user_password,
             owner_password=owner_password or user_password,
             use_128bit=True
         )
-
         output = io.BytesIO()
-        writer.write(output)
-        output.seek(0)
+        writer.write(output); output.seek(0)
         return output.getvalue()
     except Exception as e:
         st.error(f"Error protecting PDF: {e}")
@@ -942,21 +742,17 @@ def protect_pdf(pdf_file, user_password, owner_password=None, password=None):
 
 
 def unlock_pdf(pdf_file, password):
-    """Remove password protection from PDF"""
     try:
         reader = PdfReader(pdf_file)
         if reader.is_encrypted:
             if reader.decrypt(password) == 0:
                 st.error("Incorrect password")
                 return None
-
         writer = PdfWriter()
         for page in reader.pages:
             writer.add_page(page)
-
         output = io.BytesIO()
-        writer.write(output)
-        output.seek(0)
+        writer.write(output); output.seek(0)
         return output.getvalue()
     except Exception as e:
         st.error(f"Error unlocking PDF: {e}")
@@ -964,16 +760,12 @@ def unlock_pdf(pdf_file, password):
 
 
 def redact_pdf(pdf_file, redaction_areas, password=None):
-    """Redact sensitive information from PDF"""
     try:
         with TMP.create('.pdf') as temp_file:
-            temp_file.write(pdf_file.read())
-            temp_file.flush()
-
+            temp_file.write(pdf_file.read()); temp_file.flush()
             doc = fitz.open(temp_file.name)
             if doc.needs_pass and password:
                 doc.authenticate(password)
-
             for page_num, areas in redaction_areas.items():
                 if page_num < doc.page_count:
                     page = doc[page_num]
@@ -981,11 +773,8 @@ def redact_pdf(pdf_file, redaction_areas, password=None):
                         rect = fitz.Rect(area)
                         page.add_redact_annot(rect, fill=(0, 0, 0))
                     page.apply_redactions()
-
             output = io.BytesIO()
-            doc.save(output)
-            doc.close()
-
+            doc.save(output); doc.close()
             output.seek(0)
             return output.getvalue()
     except Exception as e:
@@ -996,31 +785,20 @@ def redact_pdf(pdf_file, redaction_areas, password=None):
 # ---------- COMPARISON FUNCTIONS ----------
 
 def compare_pdfs(pdf1, pdf2, password1=None, password2=None):
-    """Compare two PDF files (simple line diff based on extracted text)"""
     try:
         text1 = pdf_to_text(pdf1, password1)
         text2 = pdf_to_text(pdf2, password2)
-
         if text1 is None or text2 is None:
             return None
-
         lines1 = text1.split('\n')
         lines2 = text2.split('\n')
-
         differences = []
         max_lines = max(len(lines1), len(lines2))
-
         for i in range(max_lines):
             line1 = lines1[i] if i < len(lines1) else ""
             line2 = lines2[i] if i < len(lines2) else ""
-
             if line1 != line2:
-                differences.append({
-                    'line': i + 1,
-                    'pdf1': line1,
-                    'pdf2': line2
-                })
-
+                differences.append({'line': i + 1, 'pdf1': line1, 'pdf2': line2})
         return differences
     except Exception as e:
         st.error(f"Error comparing PDFs: {e}")
@@ -1030,7 +808,6 @@ def compare_pdfs(pdf1, pdf2, password1=None, password2=None):
 # ---------- MAIN STREAMLIT APP ----------
 
 def main():
-    # Header
     st.markdown("""
     <div class="main-header">
         <h1>📄 Comprehensive PDF Toolkit</h1>
@@ -1038,14 +815,15 @@ def main():
     </div>
     """, unsafe_allow_html=True)
 
-    # Sidebar for tool selection
     st.sidebar.title("🛠️ PDF Tools")
 
-    # Manual cleanup button in sidebar
+    # Manual cleanup (temps + uploads)
     st.sidebar.markdown("---")
     if st.sidebar.button("🧹 Clear Temporary Files Now"):
         TMP.cleanup()
-        st.sidebar.success("All temporary files cleared.")
+        UP.clear_all()
+        st.sidebar.success("All temporary files and uploads cleared.")
+        st.rerun()
 
     tool_categories = {
         "📁 Organize": [
@@ -1074,10 +852,14 @@ def main():
     selected_category = st.sidebar.selectbox("Select Category", list(tool_categories.keys()))
     selected_tool = st.sidebar.selectbox("Select Tool", tool_categories[selected_category])
 
-    # Main content area
+    # Helper to create uploaders that are tracked
+    def tracked_uploader(label, key, type, accept_multiple_files=False):
+        UP.register(key, accept_multiple_files)
+        return st.file_uploader(label, type=type, accept_multiple_files=accept_multiple_files, key=key)
+
     if selected_tool == "Merge PDFs":
         st.header("🧩 Merge PDF Files")
-        uploaded_pdfs = st.file_uploader("Upload multiple PDFs", type=["pdf"], accept_multiple_files=True)
+        uploaded_pdfs = tracked_uploader("Upload multiple PDFs", "u_merge_files", ["pdf"], True)
 
         if uploaded_pdfs:
             filenames = [f.name for f in uploaded_pdfs]
@@ -1118,7 +900,7 @@ def main():
 
     elif selected_tool == "Split PDF":
         st.header("✂️ Split PDF into Separate Files")
-        pdf_file = st.file_uploader("Upload PDF to Split", type=["pdf"])
+        pdf_file = tracked_uploader("Upload PDF to Split", "u_split_pdf", ["pdf"])
         password = st.text_input("Password if encrypted", type="password")
 
         if pdf_file:
@@ -1129,18 +911,15 @@ def main():
                     reader.decrypt(password)
                 num_pages = len(reader.pages)
                 st.info(f"PDF has {num_pages} pages.")
-
                 pdf_file.seek(0)
                 preview = get_pdf_preview(pdf_file, 0, password)
                 if preview:
                     st.image(preview, caption="First page preview", width=300)
-
             except Exception as e:
                 st.error(f"Unable to read PDF: {e}")
                 return
 
             st.subheader("Page Splitting Options")
-
             auto_split = st.checkbox("🔁 Auto-split in equal groups")
             if auto_split:
                 group_size = st.number_input("Pages per group", min_value=1, max_value=num_pages, value=2, step=1)
@@ -1151,7 +930,6 @@ def main():
             if st.button("Split PDF", type="primary"):
                 try:
                     ranges = []
-
                     if auto_split:
                         for start in range(1, num_pages + 1, group_size):
                             end = min(start + group_size - 1, num_pages)
@@ -1189,39 +967,27 @@ def main():
                             TMP.cleanup()
                             st.info("Temporary files removed.")
 
-                except Exception as e:
-                    st.error(f"Error processing split: {e}")
-
     elif selected_tool == "Compress PDF":
         st.header("🗜️ Compress PDF")
-        pdf_file = st.file_uploader("Upload PDF file", type=["pdf"])
+        pdf_file = tracked_uploader("Upload PDF file", "u_compress_pdf", ["pdf"])
         password = st.text_input("Password if encrypted", type="password")
 
         quality = st.select_slider("Compression Quality",
-                                 options=["High Quality", "Medium Quality", "High Compression"],
-                                 value="Medium Quality")
-
+                                   options=["High Quality", "Medium Quality", "High Compression"],
+                                   value="Medium Quality")
         quality_map = {"High Quality": "high", "Medium Quality": "medium", "High Compression": "low"}
 
         if pdf_file and st.button("Compress PDF", type="primary"):
             with st.spinner("Compressing PDF..."):
-                pdf_file.seek(0)
-                original_size = len(pdf_file.read())
-                pdf_file.seek(0)
-
+                pdf_file.seek(0); original_size = len(pdf_file.read()); pdf_file.seek(0)
                 compressed_pdf = compress_pdf(pdf_file, quality_map[quality], password)
                 if compressed_pdf:
                     compressed_size = len(compressed_pdf)
                     compression_ratio = ((original_size - compressed_size) / original_size) * 100
-
                     col1, col2, col3 = st.columns(3)
-                    with col1:
-                        st.metric("Original Size", f"{original_size / 1024 / 1024:.2f} MB")
-                    with col2:
-                        st.metric("Compressed Size", f"{compressed_size / 1024 / 1024:.2f} MB")
-                    with col3:
-                        st.metric("Space Saved", f"{compression_ratio:.1f}%")
-
+                    with col1: st.metric("Original Size", f"{original_size / 1024 / 1024:.2f} MB")
+                    with col2: st.metric("Compressed Size", f"{compressed_size / 1024 / 1024:.2f} MB")
+                    with col3: st.metric("Space Saved", f"{compression_ratio:.1f}%")
                     st.success("PDF compressed successfully!")
                     clicked = st.download_button("📥 Download Compressed PDF", compressed_pdf,
                                                  file_name="compressed.pdf", mime="application/pdf", key="dl_compress")
@@ -1231,7 +997,7 @@ def main():
 
     elif selected_tool == "PDF to Word":
         st.header("📄 Convert PDF to Word")
-        pdf_file = st.file_uploader("Upload PDF file", type=["pdf"])
+        pdf_file = tracked_uploader("Upload PDF file", "u_pdf2word_pdf", ["pdf"])
         password = st.text_input("Password if encrypted", type="password")
 
         if pdf_file:
@@ -1240,12 +1006,9 @@ def main():
             if info:
                 col1, col2 = st.columns(2)
                 with col1:
-                    st.metric("Pages", info['pages'])
-                    st.metric("Title", info['title'])
+                    st.metric("Pages", info['pages']); st.metric("Title", info['title'])
                 with col2:
-                    st.metric("Author", info['author'])
-                    st.metric("Creator", info['creator'])
-
+                    st.metric("Author", info['author']); st.metric("Creator", info['creator'])
             pdf_file.seek(0)
             preview = get_pdf_preview(pdf_file, 0, password)
             if preview:
@@ -1268,7 +1031,7 @@ def main():
 
     elif selected_tool == "Images to PDF":
         st.header("🖼️ Convert Images to PDF")
-        image_files = st.file_uploader("Upload images", type=["jpg", "jpeg", "png", "bmp"], accept_multiple_files=True)
+        image_files = tracked_uploader("Upload images", "u_images_to_pdf", ["jpg", "jpeg", "png", "bmp"], True)
 
         if image_files:
             st.subheader("Preview Images")
@@ -1289,7 +1052,7 @@ def main():
 
     elif selected_tool == "PDF to Images":
         st.header("🖼️ Convert PDF to Images")
-        pdf_file = st.file_uploader("Upload PDF file", type=["pdf"])
+        pdf_file = tracked_uploader("Upload PDF file", "u_pdf2images_pdf", ["pdf"])
         password = st.text_input("Password if encrypted", type="password")
 
         col1, col2 = st.columns(2)
@@ -1304,12 +1067,10 @@ def main():
                 images = pdf_to_images(pdf_file, image_format, dpi, password)
                 if images:
                     st.success(f"Converted {len(images)} pages to images!")
-
                     zip_buffer = io.BytesIO()
                     with zipfile.ZipFile(zip_buffer, 'w') as zip_file:
                         for name, img_data in images:
                             zip_file.writestr(name, img_data)
-
                     zip_buffer.seek(0)
                     clicked = st.download_button("📥 Download All Images (ZIP)", zip_buffer.getvalue(),
                                                  file_name="pdf_images.zip", mime="application/zip", key="dl_pdf_images_zip")
@@ -1319,14 +1080,13 @@ def main():
 
     elif selected_tool == "PDF to Excel":
         st.header("📊 Convert PDF to Excel")
-        pdf_file = st.file_uploader("Upload PDF file", type=["pdf"])
+        pdf_file = tracked_uploader("Upload PDF file", "u_pdf2excel_pdf", ["pdf"])
         password = st.text_input("Password if encrypted", type="password")
 
         col1, col2 = st.columns(2)
         with col1:
-            extraction_method = st.selectbox("Extraction Method",
-                                        ["tables", "text"],
-                                        help="Tables: Extract structured tables\nText: Parse text as potential tables")
+            extraction_method = st.selectbox("Extraction Method", ["tables", "text"],
+                                             help="Tables: Extract structured tables\nText: Parse text as potential tables")
         with col2:
             if pdf_file:
                 pdf_file.seek(0)
@@ -1356,7 +1116,7 @@ def main():
 
     elif selected_tool == "Add Watermark":
         st.header("💧 Add Watermark to PDF")
-        pdf_file = st.file_uploader("Upload PDF file", type=["pdf"])
+        pdf_file = tracked_uploader("Upload PDF file", "u_watermark_pdf", ["pdf"])
         password = st.text_input("Password if encrypted", type="password")
 
         col1, col2 = st.columns(2)
@@ -1380,7 +1140,7 @@ def main():
 
     elif selected_tool == "Protect PDF":
         st.header("🔒 Protect PDF with Password")
-        pdf_file = st.file_uploader("Upload PDF file", type=["pdf"])
+        pdf_file = tracked_uploader("Upload PDF file", "u_protect_pdf", ["pdf"])
         current_password = st.text_input("Current Password (if encrypted)", type="password")
 
         col1, col2 = st.columns(2)
@@ -1403,7 +1163,7 @@ def main():
 
     elif selected_tool == "Unlock PDF":
         st.header("🔓 Remove Password Protection")
-        pdf_file = st.file_uploader("Upload encrypted PDF file", type=["pdf"])
+        pdf_file = tracked_uploader("Upload encrypted PDF file", "u_unlock_pdf", ["pdf"])
         password = st.text_input("Enter PDF Password", type="password")
 
         if pdf_file and password and st.button("Unlock PDF", type="primary"):
@@ -1420,9 +1180,8 @@ def main():
 
     elif selected_tool == "OCR PDF":
         st.header("🔍 OCR - Make PDF Searchable")
-        pdf_file = st.file_uploader("Upload PDF file", type=["pdf"])
+        pdf_file = tracked_uploader("Upload PDF file", "u_ocr_pdf", ["pdf"])
         password = st.text_input("Password if encrypted", type="password")
-
         language = st.selectbox("OCR Language", ["eng", "spa", "fra", "deu", "ita", "por"])
 
         if pdf_file and st.button("Perform OCR", type="primary"):
@@ -1439,7 +1198,7 @@ def main():
 
     elif selected_tool == "Add Page Numbers":
         st.header("🔢 Add Page Numbers")
-        pdf_file = st.file_uploader("Upload PDF file", type=["pdf"])
+        pdf_file = tracked_uploader("Upload PDF file", "u_pagenum_pdf", ["pdf"])
         password = st.text_input("Password if encrypted", type="password")
 
         col1, col2 = st.columns(2)
@@ -1462,9 +1221,8 @@ def main():
 
     elif selected_tool == "Rotate PDF":
         st.header("🔄 Rotate PDF Pages")
-        pdf_file = st.file_uploader("Upload PDF file", type=["pdf"])
+        pdf_file = tracked_uploader("Upload PDF file", "u_rotate_pdf", ["pdf"])
         password = st.text_input("Password if encrypted", type="password")
-
         rotation_angle = st.selectbox("Rotation Angle", [90, 180, 270])
 
         if pdf_file:
@@ -1472,10 +1230,8 @@ def main():
             info = get_pdf_info(pdf_file)
             if info:
                 st.info(f"PDF has {info['pages']} pages")
-
                 page_option = st.radio("Rotate", ["All pages", "Specific pages"])
                 pages_to_rotate = None
-
                 if page_option == "Specific pages":
                     page_input = st.text_input("Page numbers (e.g., 1,3,5 or 1-3)")
                     if page_input:
@@ -1504,7 +1260,7 @@ def main():
 
     elif selected_tool == "Remove Pages":
         st.header("🗑️ Remove Pages from PDF")
-        pdf_file = st.file_uploader("Upload PDF file", type=["pdf"])
+        pdf_file = tracked_uploader("Upload PDF file", "u_remove_pdf", ["pdf"])
         password = st.text_input("Password if encrypted", type="password")
 
         if pdf_file:
@@ -1512,9 +1268,7 @@ def main():
             info = get_pdf_info(pdf_file)
             if info:
                 st.info(f"PDF has {info['pages']} pages")
-
                 pages_to_remove_input = st.text_input("Pages to remove (e.g., 1,3,5 or 1-3)")
-
                 if pages_to_remove_input and st.button("Remove Pages", type="primary"):
                     try:
                         pages_to_remove = []
@@ -1524,7 +1278,6 @@ def main():
                                 pages_to_remove.extend(range(start-1, end))
                             else:
                                 pages_to_remove.append(int(part.strip())-1)
-
                         with st.spinner("Removing pages..."):
                             pdf_file.seek(0)
                             result_pdf = remove_pdf_pages(pdf_file, pages_to_remove, password)
@@ -1540,7 +1293,7 @@ def main():
 
     elif selected_tool == "Extract Pages":
         st.header("📋 Extract Pages from PDF")
-        pdf_file = st.file_uploader("Upload PDF file", type=["pdf"])
+        pdf_file = tracked_uploader("Upload PDF file", "u_extract_pdf", ["pdf"])
         password = st.text_input("Password if encrypted", type="password")
 
         if pdf_file:
@@ -1548,9 +1301,7 @@ def main():
             info = get_pdf_info(pdf_file)
             if info:
                 st.info(f"PDF has {info['pages']} pages")
-
                 pages_to_extract_input = st.text_input("Pages to extract (e.g., 1,3,5 or 1-3)")
-
                 if pages_to_extract_input and st.button("Extract Pages", type="primary"):
                     try:
                         pages_to_extract = []
@@ -1560,7 +1311,6 @@ def main():
                                 pages_to_extract.extend(range(start-1, end))
                             else:
                                 pages_to_extract.append(int(part.strip())-1)
-
                         with st.spinner("Extracting pages..."):
                             pdf_file.seek(0)
                             result_pdf = extract_pdf_pages(pdf_file, pages_to_extract, password)
@@ -1576,18 +1326,15 @@ def main():
 
     elif selected_tool == "Text to PDF":
         st.header("📝 Convert Text to PDF")
-
         input_method = st.radio("Input Method", ["Type Text", "Upload Text File"])
-
         if input_method == "Type Text":
             text_content = st.text_area("Enter text content", height=200, value="Enter your text here...")
         else:
-            text_file = st.file_uploader("Upload text file", type=["txt"])
+            text_file = tracked_uploader("Upload text file", "u_text_file", ["txt"])
             if text_file:
                 text_content = text_file.read().decode('utf-8')
             else:
                 text_content = ""
-
         if text_content and st.button("Convert to PDF", type="primary"):
             with st.spinner("Converting text to PDF..."):
                 pdf_bytes = text_to_pdf(text_content)
@@ -1601,7 +1348,7 @@ def main():
 
     elif selected_tool == "PDF to Text":
         st.header("📝 Extract Text from PDF")
-        pdf_file = st.file_uploader("Upload PDF file", type=["pdf"])
+        pdf_file = tracked_uploader("Upload PDF file", "u_pdf2text_pdf", ["pdf"])
         password = st.text_input("Password if encrypted", type="password")
 
         if pdf_file and st.button("Extract Text", type="primary"):
@@ -1620,19 +1367,17 @@ def main():
 
     elif selected_tool == "Compare PDFs":
         st.header("🔍 Compare Two PDFs")
-
         col1, col2 = st.columns(2)
         with col1:
-            pdf1 = st.file_uploader("Upload first PDF", type=["pdf"], key="pdf1")
+            pdf1 = tracked_uploader("Upload first PDF", "pdf1", ["pdf"])
             password1 = st.text_input("Password for first PDF", type="password", key="pass1")
         with col2:
-            pdf2 = st.file_uploader("Upload second PDF", type=["pdf"], key="pdf2")
+            pdf2 = tracked_uploader("Upload second PDF", "pdf2", ["pdf"])
             password2 = st.text_input("Password for second PDF", type="password", key="pass2")
 
         if pdf1 and pdf2 and st.button("Compare PDFs", type="primary"):
             with st.spinner("Comparing PDFs..."):
-                pdf1.seek(0)
-                pdf2.seek(0)
+                pdf1.seek(0); pdf2.seek(0)
                 differences = compare_pdfs(pdf1, pdf2, password1, password2)
                 if differences is not None:
                     if differences:
@@ -1647,7 +1392,7 @@ def main():
 
     elif selected_tool == "PDF Info":
         st.header("ℹ️ PDF Information")
-        pdf_file = st.file_uploader("Upload PDF file", type=["pdf"])
+        pdf_file = tracked_uploader("Upload PDF file", "u_pdfinfo_pdf", ["pdf"])
         password = st.text_input("Password if encrypted", type="password")
 
         if pdf_file:
@@ -1655,7 +1400,6 @@ def main():
             info = get_pdf_info(pdf_file)
             if info:
                 st.markdown("### 📋 PDF Details")
-
                 col1, col2 = st.columns(2)
                 with col1:
                     st.metric("📄 Pages", info['pages'])
@@ -1665,7 +1409,6 @@ def main():
                     st.metric("🛠️ Creator", info['creator'])
                     st.metric("📅 Created", info['creation_date'])
                     st.metric("📅 Modified", info['modification_date'])
-
                 pdf_file.seek(0)
                 preview = get_pdf_preview(pdf_file, 0, password)
                 if preview:
@@ -1674,28 +1417,20 @@ def main():
 
     elif selected_tool == "Optimize PDF":
         st.header("⚡ Optimize PDF")
-        pdf_file = st.file_uploader("Upload PDF file", type=["pdf"])
+        pdf_file = tracked_uploader("Upload PDF file", "u_optimize_pdf", ["pdf"])
         password = st.text_input("Password if encrypted", type="password")
 
         if pdf_file and st.button("Optimize PDF", type="primary"):
             with st.spinner("Optimizing PDF..."):
-                pdf_file.seek(0)
-                original_size = len(pdf_file.read())
-                pdf_file.seek(0)
-
+                pdf_file.seek(0); original_size = len(pdf_file.read()); pdf_file.seek(0)
                 optimized_pdf = optimize_pdf(pdf_file, password)
                 if optimized_pdf:
                     optimized_size = len(optimized_pdf)
                     optimization_ratio = ((original_size - optimized_size) / original_size) * 100
-
                     col1, col2, col3 = st.columns(3)
-                    with col1:
-                        st.metric("Original Size", f"{original_size / 1024 / 1024:.2f} MB")
-                    with col2:
-                        st.metric("Optimized Size", f"{optimized_size / 1024 / 1024:.2f} MB")
-                    with col3:
-                        st.metric("Space Saved", f"{optimization_ratio:.1f}%")
-
+                    with col1: st.metric("Original Size", f"{original_size / 1024 / 1024:.2f} MB")
+                    with col2: st.metric("Optimized Size", f"{optimized_size / 1024 / 1024:.2f} MB")
+                    with col3: st.metric("Space Saved", f"{optimization_ratio:.1f}%")
                     st.success("PDF optimized successfully!")
                     clicked = st.download_button("📥 Download Optimized PDF", optimized_pdf,
                                                  file_name="optimized.pdf", mime="application/pdf", key="dl_optimize")
@@ -1705,7 +1440,7 @@ def main():
 
     elif selected_tool == "Repair PDF":
         st.header("🔧 Repair Corrupted PDF")
-        pdf_file = st.file_uploader("Upload corrupted PDF file", type=["pdf"])
+        pdf_file = tracked_uploader("Upload corrupted PDF file", "u_repair_pdf", ["pdf"])
         password = st.text_input("Password if encrypted", type="password")
 
         if pdf_file and st.button("Repair PDF", type="primary"):
@@ -1722,7 +1457,7 @@ def main():
 
     elif selected_tool == "Crop PDF":
         st.header("✂️ Crop PDF Pages")
-        pdf_file = st.file_uploader("Upload PDF file", type=["pdf"])
+        pdf_file = tracked_uploader("Upload PDF file", "u_crop_pdf", ["pdf"])
         password = st.text_input("Password if encrypted", type="password")
 
         st.subheader("Crop Settings")
@@ -1733,7 +1468,6 @@ def main():
         with col2:
             right = st.number_input("Right margin", min_value=0, value=545)
             bottom = st.number_input("Bottom margin", min_value=0, value=792)
-
         crop_box = [left, top, right, bottom]
 
         if pdf_file and st.button("Crop PDF", type="primary"):
@@ -1750,9 +1484,8 @@ def main():
 
     elif selected_tool == "Redact PDF":
         st.header("🖍️ Redact Sensitive Information")
-        pdf_file = st.file_uploader("Upload PDF file", type=["pdf"])
+        pdf_file = tracked_uploader("Upload PDF file", "u_redact_pdf", ["pdf"])
         password = st.text_input("Password if encrypted", type="password")
-
         st.info("This is a simplified redaction tool. For production use, consider professional redaction software.")
 
         if pdf_file:
@@ -1760,9 +1493,7 @@ def main():
             info = get_pdf_info(pdf_file)
             if info:
                 st.info(f"PDF has {info['pages']} pages")
-
                 page_num = st.number_input("Page to redact", min_value=1, max_value=info['pages'], value=1) - 1
-
                 st.subheader("Redaction Area (coordinates)")
                 col1, col2 = st.columns(2)
                 with col1:
@@ -1771,7 +1502,6 @@ def main():
                 with col2:
                     x2 = st.number_input("X2", min_value=0, value=200)
                     y2 = st.number_input("Y2", min_value=0, value=150)
-
                 redaction_areas = {page_num: [[x1, y1, x2, y2]]}
 
                 if st.button("Redact PDF", type="primary"):
@@ -1788,7 +1518,7 @@ def main():
 
     elif selected_tool == "Organize Pages":
         st.header("📑 Organize PDF Pages")
-        pdf_file = st.file_uploader("Upload PDF file", type=["pdf"])
+        pdf_file = tracked_uploader("Upload PDF file", "u_organize_pdf", ["pdf"])
         password = st.text_input("Password if encrypted", type="password")
 
         if pdf_file:
@@ -1796,14 +1526,11 @@ def main():
             info = get_pdf_info(pdf_file)
             if info:
                 st.info(f"PDF has {info['pages']} pages")
-
                 st.subheader("New Page Order")
                 new_order_input = st.text_input("Enter new page order (e.g., 3,1,2,4)")
-
                 if new_order_input and st.button("Reorganize Pages", type="primary"):
                     try:
                         new_order = [int(x.strip()) - 1 for x in new_order_input.split(',')]
-
                         if len(new_order) != info['pages'] or any(x < 0 or x >= info['pages'] for x in new_order):
                             st.error("Invalid page order. Please specify all pages exactly once.")
                         else:
