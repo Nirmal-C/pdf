@@ -83,13 +83,12 @@ class UploadManager:
         st.session_state.UPLOAD_KEYS[key] = is_multi
 
     def clear_all(self):
-        for key, is_multi in list(st.session_state.UPLOAD_KEYS.items()):
-            if key in st.session_state:
-                st.session_state[key] = [] if is_multi else None
+        # IMPORTANT: don't assign to widget keys; remove them (Streamlit policy)
+        for key in list(st.session_state.get("UPLOAD_KEYS", {}).keys()):
+            st.session_state.pop(key, None)
         # Clear any helper states tied to uploads
         for helper_key in ["file_order"]:
-            if helper_key in st.session_state:
-                st.session_state.pop(helper_key)
+            st.session_state.pop(helper_key, None)
 
 
 TMP = TempManager()
@@ -813,13 +812,19 @@ def main():
 
     st.sidebar.title("🛠️ PDF Tools")
 
-    # Manual cleanup (temps + uploads)
+    # Manual cleanup (temps + uploads) via callback (Streamlit-safe)
     st.sidebar.markdown("---")
-    if st.sidebar.button("🧹 Clear Temporary Files Now"):
+
+    def _clear_everything():
         TMP.cleanup()
         UP.clear_all()
+        st.session_state["__just_cleared__"] = True
+
+    st.sidebar.button("🧹 Clear Temporary Files Now", on_click=_clear_everything)
+
+    # one-time toast after callback
+    if st.session_state.pop("__just_cleared__", False):
         st.sidebar.success("All temporary files and uploads cleared.")
-        st.rerun()
 
     tool_categories = {
         "📁 Organize": [
@@ -900,7 +905,7 @@ def main():
         password = st.text_input("Password if encrypted", type="password")
 
         if pdf_file:
-            # Safely read basic info (CLOSED try/except so it can't leak)
+            # Safely read basic info
             num_pages = None
             try:
                 pdf_file.seek(0)
@@ -913,7 +918,6 @@ def main():
 
             if num_pages:
                 st.info(f"PDF has {num_pages} pages.")
-                # Preview (do not wrap the whole block in try)
                 pdf_file.seek(0)
                 preview = get_pdf_preview(pdf_file, 0, password)
                 if preview:
