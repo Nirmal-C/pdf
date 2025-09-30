@@ -1573,15 +1573,20 @@ def main():
     # Footer
     st.markdown("---")
     st.markdown("""
-   <div style="text-align: center; color: #666; padding: 2rem;">
+  <div style="text-align: center; color: #666; padding: 2rem;">
   <p>Comprehensive PDF Toolkit - Your all-in-one PDF solution</p>
   <p>
     Built with ❤️ by 
-    <a href="https://nirmalchathura.dev" target="_blank" style="color: #666; text-decoration: none;">
+    <a href="https://nirmalchathura.dev" 
+       target="_blank" 
+       style="color: #007BFF; text-decoration: none; font-weight: 500; transition: color 0.3s;"
+       onmouseover="this.style.color='#0056b3'"
+       onmouseout="this.style.color='#007BFF'">
       Nirmal
     </a>
   </p>
 </div>
+
 
     """, unsafe_allow_html=True)
 
